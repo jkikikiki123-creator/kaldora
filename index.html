@@ -1261,6 +1261,7 @@ function snapKeys(){
   const m = {};
   Object.keys(S.chars || {}).forEach(id => m['chars/' + id] = JSON.stringify(S.chars[id]));
   m['patches'] = JSON.stringify(S.patches || []);
+  m['config'] = JSON.stringify(S.config || {});
   return m;
 }
 function fbPut(path, body){
@@ -1302,7 +1303,7 @@ function applyRemote(){
   const before = {}; CHARS.forEach(ch => before[ch.id] = lvl((S.chars[ch.id] || {}).xp || 0));
   if (!fbReady){
     fbReady = true;
-    const empty = !remote.chars || !Object.keys(remote.chars).length;
+    const empty = (!remote.chars || !Object.keys(remote.chars).length) && !remote.config;
     if (empty && localHasData()){
       synced = {}; fbPush(); fbInitial = false;
       toast('Ваша летопись загружена в общую базу отряда');
@@ -1311,12 +1312,12 @@ function applyRemote(){
   }
   const chars = {};
   Object.keys(remote.chars || {}).forEach(id => { chars[id] = remote.chars[id] || {}; });
-  S.chars = chars; S.patches = toArr(remote.patches);
+  S.chars = chars; S.patches = toArr(remote.patches); S.config = (remote.config && typeof remote.config === 'object') ? remote.config : {};
   Object.keys(S.chars).forEach(id => C(id));
   synced = snapKeys();
   // keep unsent local edits on top of the remote copy
   Object.keys(dirty).forEach(k => {
-    try { const v = JSON.parse(dirty[k]); if (k === 'patches') S.patches = v; else S.chars[k.slice(6)] = v; } catch(e){}
+    try { const v = JSON.parse(dirty[k]); if (k === 'patches') S.patches = v; else if (k === 'config') S.config = v; else S.chars[k.slice(6)] = v; } catch(e){}
     delete synced[k];
   });
   if (Object.keys(dirty).length) fbPush();
@@ -1352,6 +1353,15 @@ function startShared(){
   es.onopen = () => setNet(true);
   es.onerror = () => setNet(false);
 }
+
+/* ================= GM REPORTS ================= */
+function report(text){
+  const url = S.config && S.config.logUrl;
+  if (!url || !tg || !tg.initData) return Promise.resolve(null);
+  return fetch(url, {method:'POST', headers:{'Content-Type':'text/plain'}, body: JSON.stringify({initData: tg.initData, text})})
+    .then(r => r.json()).catch(() => null);
+}
+const lvNote = (id, before) => { const a = lvl(C(id).xp); return a > before ? ` · новый уровень: ${a}!` : a < before ? ` · уровень понижен до ${a}` : ''; };
 
 /* ================= HELPERS ================= */
 const $ = (s, r) => (r||document).querySelector(s);
@@ -1829,6 +1839,10 @@ function sheetPatch(pid){
 function sheetSettings(){
   sheet(`<h3>Летопись</h3>
     <div class="note-box center">${SHARED ? 'Это общая летопись отряда: все изменения сразу видят все, кто открывает бота. Удаление и загрузка копии затронут данные всего отряда.' : CLOUD ? 'Данные сохраняются в облаке Telegram и доступны с любого вашего устройства.' : 'Сейчас данные хранятся только в этом браузере. Откройте приложение через бота в Telegram, чтобы включить облачное хранение.'}</div>
+    <label>Отчёты ГМу в Telegram</label>
+    <input class="field" id="log-url" value="${esc((S.config && S.config.logUrl) || '')}" placeholder="https://kaldora-log.….workers.dev" autocomplete="off">
+    <div class="note-box">Адрес посредника Cloudflare. Когда кто-то меняет опыт, ГМу в личку приходит отчёт с именем того, кто это сделал.</div>
+    <div class="two"><button class="pb dark" data-a="logtest">Тест</button><button class="pb" data-a="logsave">Сохранить</button></div>
     <label>Резервная копия</label>
     <textarea class="field" id="exp" readonly style="min-height:90px;font-size:13px;font-family:monospace">${esc(JSON.stringify(S))}</textarea>
     <button class="pb dark" data-a="copyexp">Скопировать</button>
@@ -2066,16 +2080,21 @@ const ACT = {
   addchip(b){ const i = $('#'+b.dataset.t); i.value = num(i.value) + num(b.dataset.v); i.dispatchEvent(new Event('input')); hap('sel'); },
   xpsave(b){
     const d = num($('#x-amt').value); if (d <= 0){ toast('Впишите количество опыта'); hap('warn'); return; }
-    addXP(b.dataset.id, d, $('#x-note').value.trim()); closeSheet(); render(); hap('medium');
+    const id = b.dataset.id, lv0 = lvl(C(id).xp), note = $('#x-note').value.trim();
+    addXP(id, d, note); closeSheet(); render(); hap('medium');
+    report(`Опыт персонажа ${CH(id).name} изменен на +${fmt(d)} (итого ${fmt(C(id).xp)} XP)${lvNote(id, lv0)}${note ? `
+Пометка: ${note}` : ''}`);
     toast(`+${fmt(d)} XP записано`); setTimeout(showNextLvl, 450);
   },
   xpset(b){
     const id = b.dataset.id, v = Math.max(0, num($('#s-amt').value)), d = v - C(id).xp;
-    closeSheet(); if (d){ addXP(id, d, 'Исправлено вручную'); render(); setTimeout(showNextLvl, 450); }
+    closeSheet(); if (d){ const lv0 = lvl(C(id).xp); addXP(id, d, 'Исправлено вручную'); render(); setTimeout(showNextLvl, 450);
+      report(`Опыт персонажа ${CH(id).name} установлен как ${fmt(v)} (было ${fmt(v - d)})${lvNote(id, lv0)}`); }
   },
   delxp(b){
     const c = C(b.dataset.id), e = c.xpLog.find(x => x.id === b.dataset.e); if (!e) return;
     const before = lvl(c.xp); c.xp = Math.max(0, c.xp - e.d); c.xpLog = c.xpLog.filter(x => x !== e); save();
+    report(`Опыт персонажа ${CH(b.dataset.id).name} изменен на ${e.d > 0 ? '−' : '+'}${fmt(Math.abs(e.d))} — удалена запись «${e.note || 'без пометки'}» (итого ${fmt(c.xp)} XP)${lvNote(b.dataset.id, before)}`);
     const after = lvl(c.xp); if (after !== before) toast(`Уровень теперь ${after}`); render();
   },
   togglelog(b){ logOpen[b.dataset.id] = !logOpen[b.dataset.id]; render(); },
@@ -2083,8 +2102,14 @@ const ACT = {
   ptoggle(b){ const id = b.dataset.id; P.sel.has(id) ? P.sel.delete(id) : P.sel.add(id); b.classList.toggle('on', P.sel.has(id)); partyPreview(); hap('sel'); },
   psave(){
     const e = partyEach(); if (!P.sel.size || e <= 0){ toast('Впишите опыт и выберите героев'); hap('warn'); return; }
-    const note = $('#p-note').value.trim();
+    const note = $('#p-note').value.trim(), total = num($('#p-amt').value), lv0 = {};
+    CHARS.forEach(ch => lv0[ch.id] = lvl(C(ch.id).xp));
     CHARS.forEach(ch => { if (P.sel.has(ch.id)) addXP(ch.id, e, note); });
+    const who = CHARS.filter(ch => P.sel.has(ch.id));
+    const lines = who.map(ch => `• ${ch.name}: +${fmt(e)} → ${fmt(C(ch.id).xp)} XP${lvNote(ch.id, lv0[ch.id])}`).join('\n');
+    report((P.mode === 'split' ? `Разделено ${fmt(total)} опыта между персонажами (по ${fmt(e)})` : `Начислено по ${fmt(e)} опыта персонажам`) + `:
+${lines}${note ? `
+Пометка: ${note}` : ''}`);
     closeSheet(); render(); hap('medium'); toast(`Записано: ${P.sel.size} × ${fmt(e)} XP`); setTimeout(showNextLvl, 450);
   },
   gold(b){
@@ -2153,6 +2178,17 @@ const ACT = {
     closeSheet(); stack = [{v:'home'}]; render(); toast('Летопись восстановлена');
   },
   wipe(){ S = {v:1, updatedAt:0, chars:{}, patches:[]}; if (SHARED){ fbPut('', 'null').catch(() => toast('Нет связи')); synced = {}; dirty = {}; lsSet(JSON.stringify(S)); } else save(); closeSheet(); stack = [{v:'home'}]; render(); toast('Все данные стёрты'); },
+  logsave(){
+    const u = $('#log-url').value.trim();
+    if (u && !/^https:\/\//.test(u)){ toast('Адрес должен начинаться с https://'); return; }
+    S.config = Object.assign({}, S.config, {logUrl: u}); save(); toast(u ? 'Отчёты ГМу включены' : 'Отчёты выключены');
+  },
+  logtest(){
+    const u = $('#log-url').value.trim(); if (!u){ toast('Сначала впишите адрес'); return; }
+    if (!tg){ toast('Тест работает только внутри Telegram'); return; }
+    S.config = Object.assign({}, S.config, {logUrl: u}); save();
+    report('Проверка связи: отчёты из летописи Кальдоры работают ✅').then(r => toast(r && r.ok ? 'Отчёт отправлен ГМу' : `Не дошло: ${(r && r.msg) || 'нет ответа'}`));
+  },
   lvlclose: () => closeLvl()
 };
 document.addEventListener('click', e => {
