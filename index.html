@@ -1215,7 +1215,8 @@ function save(){
   S.updatedAt = Date.now();
   const s = JSON.stringify(S);
   lsSet(s);
-  if (CLOUD){ clearTimeout(cloudTimer); cloudTimer = setTimeout(() => cloudSave(s), 700); }
+  if (SHARED) fbPush();
+  else if (CLOUD){ clearTimeout(cloudTimer); cloudTimer = setTimeout(() => cloudSave(s), 700); }
 }
 function cloudSave(s){
   const size = 3800, n = Math.max(1, Math.ceil(s.length/size));
@@ -1245,6 +1246,113 @@ function cloudLoad(cb){
   });
 }
 
+
+/* ================= SHARED CHRONICLE (Firebase Realtime Database) ================= */
+const FB_URL = 'https://kaldora-1cb8e-default-rtdb.europe-west1.firebasedatabase.app'.trim().replace(/\/+$/, '');
+const SHARED = /^https:\/\/[^\s]+$/.test(FB_URL);
+const ROOT = FB_URL + '/caldora';
+let synced = {}, dirty = {}, fbReady = false, fbOnline = false, fbInitial = true, pendingRender = false;
+function toArr(v){
+  if (Array.isArray(v)) return v.filter(x => x != null);
+  if (v && typeof v === 'object') return Object.keys(v).sort((a,b) => (+a) - (+b)).map(k => v[k]).filter(x => x != null);
+  return [];
+}
+function snapKeys(){
+  const m = {};
+  Object.keys(S.chars || {}).forEach(id => m['chars/' + id] = JSON.stringify(S.chars[id]));
+  m['patches'] = JSON.stringify(S.patches || []);
+  return m;
+}
+function fbPut(path, body){
+  return fetch(`${ROOT}${path ? '/' + path : ''}.json`, {method:'PUT', body}).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r; });
+}
+function fbPush(){
+  if (!SHARED || !fbReady) return;
+  const m = snapKeys();
+  Object.keys(m).forEach(k => {
+    if (synced[k] === m[k]) return;
+    synced[k] = m[k]; dirty[k] = m[k];
+    fbPut(k, m[k]).then(() => { if (dirty[k] === m[k]) delete dirty[k]; }).catch(() => { delete synced[k]; setNet(false); });
+  });
+}
+function setNet(on){
+  if (fbOnline === on) return;
+  fbOnline = on;
+  const f = document.querySelector('.foot'); if (f) f.innerHTML = footText();
+  if (on) fbPush();
+}
+function footText(){
+  if (SHARED) return fbOnline ? '<span style="color:var(--up)">●</span> Общая летопись отряда · синхронизировано' : '<span style="color:var(--neg)">●</span> Нет связи с общей летописью — изменения отправятся позже';
+  return CLOUD ? 'Летопись хранится в облаке Telegram' : 'Летопись хранится на этом устройстве';
+}
+function localHasData(){
+  return Object.values(S.chars || {}).some(c => c && (c.xp || c.gold || c.rations || toArr(c.items).length || toArr(c.gods).length || toArr(c.xpLog).length)) || toArr(S.patches).length > 0;
+}
+let remote = {};
+function setPath(obj, path, val){
+  const parts = String(path || '/').split('/').filter(Boolean);
+  if (!parts.length) return (val && typeof val === 'object') ? val : {};
+  let o = obj;
+  for (let i=0;i<parts.length-1;i++){ if (o[parts[i]] == null || typeof o[parts[i]] !== 'object') o[parts[i]] = {}; o = o[parts[i]]; }
+  const last = parts[parts.length-1];
+  if (val === null) delete o[last]; else o[last] = val;
+  return obj;
+}
+function applyRemote(){
+  const before = {}; CHARS.forEach(ch => before[ch.id] = lvl((S.chars[ch.id] || {}).xp || 0));
+  if (!fbReady){
+    fbReady = true;
+    const empty = !remote.chars || !Object.keys(remote.chars).length;
+    if (empty && localHasData()){
+      synced = {}; fbPush(); fbInitial = false;
+      toast('Ваша летопись загружена в общую базу отряда');
+      render(); return;
+    }
+  }
+  const chars = {};
+  Object.keys(remote.chars || {}).forEach(id => { chars[id] = remote.chars[id] || {}; });
+  S.chars = chars; S.patches = toArr(remote.patches);
+  Object.keys(S.chars).forEach(id => C(id));
+  synced = snapKeys();
+  // keep unsent local edits on top of the remote copy
+  Object.keys(dirty).forEach(k => {
+    try { const v = JSON.parse(dirty[k]); if (k === 'patches') S.patches = v; else S.chars[k.slice(6)] = v; } catch(e){}
+    delete synced[k];
+  });
+  if (Object.keys(dirty).length) fbPush();
+  lsSet(JSON.stringify(S));
+  if (!fbInitial) CHARS.forEach(ch => { const a = lvl(C(ch.id).xp); if (a > before[ch.id]) lvlQueue.push({id:ch.id, from:before[ch.id], to:a}); });
+  fbInitial = false;
+  softRender();
+  setTimeout(showNextLvl, 400);
+}
+function softRender(){
+  const r = stack[stack.length-1];
+  if (r.v === 'game') return;
+  const ae = document.activeElement;
+  if (ae && $('#app').contains(ae) && /INPUT|TEXTAREA/.test(ae.tagName)){ pendingRender = true; return; }
+  const y = window.scrollY; render(); window.scrollTo(0, y);
+}
+document.addEventListener('focusout', () => setTimeout(() => { if (pendingRender && !(document.activeElement && /INPUT|TEXTAREA/.test(document.activeElement.tagName))){ pendingRender = false; softRender(); } }, 50));
+function startShared(){
+  if (!SHARED || !window.EventSource) return;
+  const es = new EventSource(ROOT + '.json');
+  const handle = (kind) => (ev) => {
+    let msg; try { msg = JSON.parse(ev.data); } catch(e){ return; }
+    if (!msg || typeof msg !== 'object') return;
+    setNet(true);
+    if (kind === 'put') remote = setPath(remote, msg.path, msg.data);
+    else { const base = String(msg.path || '/').replace(/\/+$/, ''); Object.keys(msg.data || {}).forEach(k => { remote = setPath(remote, base + '/' + k, msg.data[k]); }); }
+    if (!remote || typeof remote !== 'object') remote = {};
+    applyRemote();
+  };
+  es.addEventListener('put', handle('put'));
+  es.addEventListener('patch', handle('patch'));
+  es.addEventListener('keep-alive', () => setNet(true));
+  es.onopen = () => setNet(true);
+  es.onerror = () => setNet(false);
+}
+
 /* ================= HELPERS ================= */
 const $ = (s, r) => (r||document).querySelector(s);
 const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1253,7 +1361,7 @@ const num = v => { const x = parseInt(String(v||'').replace(/[\s ]/g,''), 10); 
 const dt = t => new Date(t).toLocaleDateString('ru-RU', {day:'numeric', month:'short', year:'2-digit'});
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,6);
 const CH = id => CHARS.find(c => c.id === id);
-const C = id => { if (!S.chars[id]) S.chars[id] = {xp:0, xpLog:[], gold:0, goldLog:[], gods:[], items:[]}; const c = S.chars[id]; if (c.rations == null) c.rations = 0; if (!c.rationLog) c.rationLog = []; return c; };
+const C = id => { if (!S.chars[id]) S.chars[id] = {}; const c = S.chars[id]; ['xp','gold','rations'].forEach(k => { if (typeof c[k] !== 'number') c[k] = 0; }); ['xpLog','goldLog','gods','items','rationLog'].forEach(k => { if (!Array.isArray(c[k])) c[k] = toArr(c[k]); }); return c; };
 const GOD = name => GODS.find(g => g[0].toLowerCase() === String(name).trim().toLowerCase());
 const RARM = k => RAR.find(r => r[0]===k) || RAR[0];
 const TYPEN = k => (TYPES.find(t => t[0]===k) || TYPES[TYPES.length-1])[1];
@@ -1396,7 +1504,7 @@ home(){
     </div>
     <div class="section">Отряд</div>
     <div class="roster">${rows}</div>
-    <p class="foot">${CLOUD ? 'Летопись хранится в облаке Telegram' : 'Летопись хранится на этом устройстве'}</p>`;
+    <p class="foot">${footText()}</p>`;
 },
 
 char(r){
@@ -1720,7 +1828,7 @@ function sheetPatch(pid){
 }
 function sheetSettings(){
   sheet(`<h3>Летопись</h3>
-    <div class="note-box center">${CLOUD ? 'Данные сохраняются в облаке Telegram и доступны с любого вашего устройства.' : 'Сейчас данные хранятся только в этом браузере. Откройте приложение через бота в Telegram, чтобы включить облачное хранение.'}</div>
+    <div class="note-box center">${SHARED ? 'Это общая летопись отряда: все изменения сразу видят все, кто открывает бота. Удаление и загрузка копии затронут данные всего отряда.' : CLOUD ? 'Данные сохраняются в облаке Telegram и доступны с любого вашего устройства.' : 'Сейчас данные хранятся только в этом браузере. Откройте приложение через бота в Telegram, чтобы включить облачное хранение.'}</div>
     <label>Резервная копия</label>
     <textarea class="field" id="exp" readonly style="min-height:90px;font-size:13px;font-family:monospace">${esc(JSON.stringify(S))}</textarea>
     <button class="pb dark" data-a="copyexp">Скопировать</button>
@@ -2039,9 +2147,12 @@ const ACT = {
   import(){
     let d; try { d = JSON.parse($('#imp').value); } catch(e){ toast('Не похоже на резервную копию'); return; }
     if (!d || typeof d.chars !== 'object'){ toast('Не похоже на резервную копию'); return; }
-    S = d; save(); closeSheet(); stack = [{v:'home'}]; render(); toast('Летопись восстановлена');
+    S = d; S.patches = toArr(S.patches);
+    if (SHARED){ fbPut('', JSON.stringify({chars:S.chars, patches:S.patches})).then(() => { synced = snapKeys(); }).catch(() => toast('Нет связи — копия не загружена')); lsSet(JSON.stringify(S)); }
+    else save();
+    closeSheet(); stack = [{v:'home'}]; render(); toast('Летопись восстановлена');
   },
-  wipe(){ S = {v:1, updatedAt:0, chars:{}}; save(); closeSheet(); stack = [{v:'home'}]; render(); toast('Все данные стёрты'); },
+  wipe(){ S = {v:1, updatedAt:0, chars:{}, patches:[]}; if (SHARED){ fbPut('', 'null').catch(() => toast('Нет связи')); synced = {}; dirty = {}; lsSet(JSON.stringify(S)); } else save(); closeSheet(); stack = [{v:'home'}]; render(); toast('Все данные стёрты'); },
   lvlclose: () => closeLvl()
 };
 document.addEventListener('click', e => {
@@ -2072,11 +2183,15 @@ if (local && local.chars) S = local;
 render();
 if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => render());
 if (CLOUD){
-  cloudLoad(remote => {
-    if (remote && remote.chars && (remote.updatedAt||0) > (S.updatedAt||0)){ S = remote; lsSet(JSON.stringify(S)); render(); }
-    else if (!remote && S.updatedAt) cloudSave(JSON.stringify(S));
+  let started = false;
+  const go2 = () => { if (!started){ started = true; startShared(); } };
+  cloudLoad(rem => {
+    if (rem && rem.chars && (rem.updatedAt||0) > (S.updatedAt||0)){ S = rem; lsSet(JSON.stringify(S)); if (!fbReady) render(); }
+    else if (!rem && S.updatedAt && !SHARED) cloudSave(JSON.stringify(S));
+    go2();
   });
-}
+  setTimeout(go2, 2500);
+} else startShared();
 })();
 </script>
 </body>
